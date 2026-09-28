@@ -1,50 +1,51 @@
+# 修改参数后重启 FAST_LIO 节点；仅修改本文件注释无需编译。`/**` 表示参数适用于任意节点名。
 /**:
     ros__parameters:
-        feature_extract_enable: false
-        point_filter_num: 3
-        max_iteration: 3
-        filter_size_surf: 0.5
-        filter_size_map: 0.5
-        cube_side_length: 1000.0
-        runtime_pos_log_enable: false
-        map_file_path: "./test.pcd"
+        feature_extract_enable: false                      # 是否提取几何特征；MID-360 使用 CustomMsg 时通常保持 false，采用直接点云配准
+        point_filter_num: 3                                # 非特征模式每累计 N 个符合线号/tag 条件的点取 1 个；整数 >=1，增大可减负载但减少细节
+        max_iteration: 3                                   # 每帧迭代滤波更新的最大次数；正整数，增大可能改善收敛但增加计算量
+        filter_size_surf: 0.5                              # 当前帧体素降采样边长 [m]，须 >0；增大可减少点数和算力，代价是丢失细节
+        filter_size_map: 0.5                               # 内部地图体素降采样边长 [m]，须 >0；增大可降低地图密度和内存占用
+        cube_side_length: 1000.0                           # 滑动局部地图立方体边长 [m]；应明显大于 det_range，增大可保留更大范围但增加内存
+        runtime_pos_log_enable: false                      # 是否写入算法调试与位姿日志；开启会增加磁盘 I/O，不等同于 rosbag 录制
+        map_file_path: "./test.pcd"                        # /map_save 服务写入的 PCD 路径；相对路径相对节点工作目录，空字符串会拒绝手动保存
 
         common:
-            lid_topic:  "/livox/lidar"
-            imu_topic:  "/livox/imu"
-            time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
-            time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
-                                        # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+            lid_topic:  "/livox/lidar"                    # Livox CustomMsg 点云输入话题；lidar_type=1 时不能改接缺少 CustomMsg 字段的普通 PointCloud2
+            imu_topic:  "/livox/imu"                      # IMU 输入话题；消息类型为 sensor_msgs/msg/Imu，时间戳需与点云处于同一时基
+            time_sync_en: false                            # 是否启用粗略软件时间自同步；内置 IMU 通常保持 false。ONLY turn on when external time synchronization is really not possible
+            time_offset_lidar_to_imu: 0.0                  # 手动时间偏移 [s]；源码按 IMU 时间减此值，未精确标定保持 0。Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                                               # 无论 time_sync_en 是否开启都会生效，未知时应设 0.0。This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
 
         preprocess:
-            lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
-            scan_line:  4
-            blind: 0.5
-            timestamp_unit: 3
-            scan_rate: 10
+            lidar_type: 1                                  # 当前配置用 1=Livox CustomMsg；源码枚举 2=Velodyne、3=Ouster、4=MID360 PointCloud2，原英文“4=任意点云”已过时。1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
+            scan_line:  4                                  # 允许的扫描线数量；MID-360 CustomMsg 为 4（line=0..3），不是分辨率，不能任意增减
+            blind: 0.5                                     # 近距离剔除阈值 [m]；CustomMsg 分支只保留距离严格大于该值的点，不改变硬件盲区
+            timestamp_unit: 3                              # PointCloud2 点时间单位：0=s、1=ms、2=us、3=ns；lidar_type=1 时固定读取 ns offset_time，本参数不生效
+            scan_rate: 10                                  # 扫描频率参考值 [Hz]；只用于缺逐点时间的机械雷达/MID360 PointCloud2 推算，lidar_type=1 时不生效
 
         mapping:
-            acc_cov: 0.1
-            gyr_cov: 0.1
-            b_acc_cov: 0.0001
-            b_gyr_cov: 0.0001
-            fov_degree:    360.0
-            det_range:     100.0
-            extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic
-            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
-            extrinsic_R: [ 1., 0., 0.,
-                            0., 1., 0.,
-                            0., 0., 1.]
+            acc_cov: 0.1                                   # 加速度过程噪声协方差权重；非标准差，增大表示更不信任加速度输入
+            gyr_cov: 0.1                                   # 角速度过程噪声协方差权重；非标准差，增大表示更不信任角速度输入
+            b_acc_cov: 0.0001                              # 加速度零偏随机游走过程噪声权重；越大允许零偏估计变化越快
+            b_gyr_cov: 0.0001                              # 角速度零偏随机游走过程噪声权重；越大允许零偏估计变化越快
+            fov_degree:    360.0                           # 历史视场参数 [deg]；当前源码仅计算夹限至 179.9 deg 的余弦但未用于裁点，修改目前不影响结果
+            det_range:     100.0                           # 局部地图移动和裁剪的参考距离 [m]，不是点云最大距离过滤；须与 cube_side_length 合理配合
+            extrinsic_est_en:  true                        # 是否在线估计 LiDAR->IMU 外参；true 仍须提供合理初值。true: enable the online estimation of IMU-LiDAR extrinsic
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]     # LiDAR 原点在 IMU 坐标系中的平移 [x,y,z]，单位 m；p_IMU = R*p_LiDAR + T
+            extrinsic_R: [ 1., 0., 0.,                     # LiDAR->IMU 旋转矩阵，行优先 3x3、无量纲；本行是第 1 行
+                            0., 1., 0.,                    # 旋转矩阵第 2 行；不要改成欧拉角
+                            0., 0., 1.]                    # 旋转矩阵第 3 行；单位阵表示两坐标轴方向一致
 
         publish:
-            path_en: true                # true: publish Path
-            effect_map_en: false         # true: publish Effects
-            map_en: true                 # true: publish Map cloud
-            scan_publish_en:  true       # false: close all the point cloud output
-            dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
-            scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+            path_en: true                                  # 是否发布 /path；当前约每 10 个处理帧追加一次位姿。true: publish Path
+            effect_map_en: false                           # 是否发布参与配准的有效点 /cloud_effected；调试用，增加带宽。true: publish Effects
+            map_en: true                                   # 是否以 1 Hz 发布近期配准点缓存 /Laser_map；它不是 ikd-tree 完整地图。true: publish Map cloud
+            scan_publish_en:  true                         # 是否发布 /cloud_registered；false 关闭世界系和 body 系点云输出但不停止定位。false: close all the point cloud output
+            dense_publish_en: false                        # true 使用去畸变点集，false 使用体素降采样点集生成世界系输出和近期地图缓存；false 点数较少。false: low down the points number in a global-frame point clouds scan.
+            scan_bodyframe_pub_en: true                    # 是否发布 /cloud_registered_body（IMU/body 系），同时要求 scan_publish_en=true。true: output the point cloud scans in IMU-body-frame
 
         pcd_save:
-            pcd_save_en: true
-            interval: -1                 # how many LiDAR frames saved in each pcd file; 
-                                        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+            pcd_save_en: true                              # 是否允许调用 /map_save 手动保存近期地图缓存；开启本身不会按帧自动落盘
+            interval: -1                                   # 当前分段保存代码已被注释，修改此参数无效。how many LiDAR frames saved in each pcd file;
+                                                               # 原上游含义：-1 将全部帧保存到单个 PCD，点数过多可能耗尽内存；当前实现不执行该逻辑。-1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

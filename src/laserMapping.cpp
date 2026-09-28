@@ -34,6 +34,8 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include <mutex>
+#include <cstdint>
+#include <stdexcept>
 #include <math.h>
 #include <thread>
 #include <fstream>
@@ -92,7 +94,13 @@ double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
-int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
+int effct_feat_num = 0, time_log_counter = 0;
+uint64_t scan_count = 0;
+int64_t publish_count = 0;
+int map_max_points = 200000, path_max_poses = 2000;
+int lidar_queue_limit = 100, imu_queue_limit = 4000;
+bool map_dirty = false;
+double map_stamp = 0.0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
@@ -282,27 +290,28 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
-    mtx_buffer.lock();
+    std::lock_guard<std::mutex> buffer_lock(mtx_buffer);
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
+        throw std::runtime_error("LiDAR timestamp moved backwards; stop and restart a new session.");
     }
     if (is_first_lidar)
     {
         is_first_lidar = false;
     }
 
+    if (lidar_buffer.size() >= static_cast<size_t>(lidar_queue_limit))
+        throw std::runtime_error("LiDAR queue limit reached; check IMU stream and timestamps, then restart.");
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
-    mtx_buffer.unlock();
+    if (runtime_pos_log && scan_count < MAXN)
+        s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     sig_buffer.notify_all();
 }
 
@@ -310,14 +319,13 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
-    mtx_buffer.lock();
+    std::lock_guard<std::mutex> buffer_lock(mtx_buffer);
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
+        throw std::runtime_error("LiDAR timestamp moved backwards; stop and restart a new session.");
     }
     if(is_first_lidar)
     {
@@ -337,13 +345,15 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
         printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
     }
 
+    if (lidar_buffer.size() >= static_cast<size_t>(lidar_queue_limit))
+        throw std::runtime_error("LiDAR queue limit reached; check IMU stream and timestamps, then restart.");
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
     
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
-    mtx_buffer.unlock();
+    if (runtime_pos_log && scan_count < MAXN)
+        s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     sig_buffer.notify_all();
 }
 
@@ -363,18 +373,18 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     double timestamp = get_time_sec(msg->header.stamp);
 
-    mtx_buffer.lock();
+    std::lock_guard<std::mutex> buffer_lock(mtx_buffer);
 
     if (timestamp < last_timestamp_imu)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        imu_buffer.clear();
+        throw std::runtime_error("IMU timestamp moved backwards; stop and restart a new session.");
     }
 
     last_timestamp_imu = timestamp;
 
+    if (imu_buffer.size() >= static_cast<size_t>(imu_queue_limit))
+        throw std::runtime_error("IMU queue limit reached; check LiDAR stream and timestamps, then restart.");
     imu_buffer.push_back(msg);
-    mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
 
@@ -578,38 +588,36 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
+// 教学地图是近期配准点的有界缓存，不是 ikd-tree 导出，也不是完整环境地图。
+// 仅在一次成功的滤波更新后调用；定时发布不能再次加入同一帧。
+void append_recent_map()
 {
-    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-    int size = laserCloudFullRes->points.size();
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(size, 1));
-
-    for (int i = 0; i < size; i++)
-    {
-        RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                            &laserCloudWorld->points[i]);
+    auto source = dense_pub_en ? feats_undistort : feats_down_body;
+    const size_t limit = static_cast<size_t>(map_max_points);
+    const size_t take = std::min(source->size(), limit);
+    const size_t keep = std::min(pcl_wait_pub->size(), limit - take);
+    pcl_wait_pub->points.erase(pcl_wait_pub->points.begin(),
+        pcl_wait_pub->points.end() - keep);
+    for (size_t i = source->size() - take; i < source->size(); ++i) {
+        PointType point{};
+        RGBpointBodyToWorld(&source->points[i], &point);
+        pcl_wait_pub->points.push_back(point);
     }
-    *pcl_wait_pub += *laserCloudWorld;
-
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
-    pubLaserCloudMap->publish(laserCloudmsg);
-
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
-    // pubLaserCloudMap->publish(laserCloudMap);
+    pcl_wait_pub->width = pcl_wait_pub->size();
+    pcl_wait_pub->height = 1;
+    map_stamp = lidar_end_time;
+    map_dirty = true;
 }
 
-void save_to_pcd()
+void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
 {
-    pcl::PCDWriter pcd_writer;
-    pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
+    if (!map_dirty || pcl_wait_pub->empty()) return;
+    sensor_msgs::msg::PointCloud2 message;
+    pcl::toROSMsg(*pcl_wait_pub, message);
+    message.header.stamp = get_ros_time(map_stamp);
+    message.header.frame_id = "camera_init";
+    pubLaserCloudMap->publish(message);
+    map_dirty = false;
 }
 
 template<typename T>
@@ -631,7 +639,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -644,6 +651,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
+    // 协方差必须随本次状态一起发布；twist 仍未实现，不能用于速度控制。
+    pubOdomAftMapped->publish(odomAftMapped);
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
     trans.child_frame_id = "body";
@@ -666,10 +675,13 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
-    jjj++;
-    if (jjj % 10 == 0) 
+    jjj = (jjj + 1) % 10;
+    if (jjj == 0) 
     {
         path.poses.push_back(msg_body_pose);
+        if (path.poses.size() > static_cast<size_t>(path_max_poses))
+            path.poses.erase(path.poses.begin());
+        path.header.stamp = msg_body_pose.header.stamp;
         pubPath->publish(path);
     }
 }
@@ -872,6 +884,13 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
+        map_max_points = this->declare_parameter<int>("publish.map_max_points", 200000);
+        path_max_poses = this->declare_parameter<int>("publish.path_max_poses", 2000);
+        lidar_queue_limit = this->declare_parameter<int>("buffers.lidar_max_frames", 100);
+        imu_queue_limit = this->declare_parameter<int>("buffers.imu_max_messages", 4000);
+        if (map_max_points < 1 || path_max_poses < 1 || lidar_queue_limit < 1 || imu_queue_limit < 1)
+            throw std::invalid_argument("Map, path and sensor queue limits must be positive.");
+
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
 
@@ -906,15 +925,15 @@ public:
         /*** debug record ***/
         // FILE *fp;
         string pos_log_dir = root_dir + "/Log/pos_log.txt";
-        fp = fopen(pos_log_dir.c_str(),"w");
+        if (runtime_pos_log) fp = fopen(pos_log_dir.c_str(),"w");
 
         // ofstream fout_pre, fout_out, fout_dbg;
-        fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
-        fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
-        fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
-        if (fout_pre && fout_out)
+        if (runtime_pos_log) fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
+        if (runtime_pos_log) fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
+        if (runtime_pos_log) fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
+        if (runtime_pos_log && fout_pre && fout_out)
             cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
-        else
+        else if (runtime_pos_log)
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
@@ -951,7 +970,7 @@ public:
     {
         fout_out.close();
         fout_pre.close();
-        fclose(fp);
+        if (fp) fclose(fp);
     }
 
 private:
@@ -996,6 +1015,8 @@ private:
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
+            if (feats_down_size > 100000)
+                throw std::runtime_error("Downsampled scan exceeds fixed feature array capacity.");
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
@@ -1028,7 +1049,7 @@ private:
             feats_down_world->resize(feats_down_size);
 
             V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
-            fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
+            if (runtime_pos_log && time_log_counter < MAXN && fout_pre) fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
             <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
 
             if(0) // If you need to see map point, change to "if(1)"
@@ -1068,6 +1089,7 @@ private:
             map_incremental();
             t5 = omp_get_wtime();
             
+            if (map_pub_en || pcd_save_en) append_recent_map();
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
@@ -1076,7 +1098,7 @@ private:
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
-            if (runtime_pos_log)
+            if (runtime_pos_log && time_log_counter < MAXN)
             {
                 frame_num ++;
                 kdtree_size_end = ikdtree.size();
@@ -1102,7 +1124,7 @@ private:
                 ext_euler = SO3ToEuler(state_point.offset_R_L_I);
                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
-                dump_lio_state_to_log(fp);
+                if (fp) dump_lio_state_to_log(fp);
             }
         }
     }
@@ -1114,17 +1136,20 @@ private:
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
-        if (pcd_save_en)
-        {
-            save_to_pcd();
+        (void)req;
+        res->success = false;
+        if (!pcd_save_en) { res->message = "Map save disabled."; return; }
+        if (pcl_wait_pub->empty()) { res->message = "Map is empty; wait for initialized LiDAR/IMU data."; return; }
+        if (map_file_path.empty()) { res->message = "map_file_path is empty."; return; }
+        try {
+            pcl::PCDWriter writer;
+            if (writer.writeBinary(map_file_path, *pcl_wait_pub) != 0)
+                throw std::runtime_error("PCD writer returned an error");
             res->success = true;
-            res->message = "Map saved.";
-        }
-        else
-        {
-            res->success = false;
-            res->message = "Map save disabled.";
+            res->message = "Recent map snapshot saved: " + map_file_path +
+                " (" + std::to_string(pcl_wait_pub->size()) + " points; not a full-session map).";
+        } catch (const std::exception &error) {
+            res->message = "Map save failed: " + std::string(error.what());
         }
     }
 
@@ -1150,7 +1175,7 @@ private:
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
 
-    FILE *fp;
+    FILE *fp = nullptr;
     ofstream fout_pre, fout_out, fout_dbg;
 };
 
@@ -1160,7 +1185,13 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    try {
+        rclcpp::spin(std::make_shared<LaserMappingNode>());
+    } catch (const std::exception &error) {
+        RCLCPP_ERROR(rclcpp::get_logger("fastlio_mapping"), "%s", error.what());
+        if (rclcpp::ok()) rclcpp::shutdown();
+        return 1;
+    }
 
     if (rclcpp::ok())
         rclcpp::shutdown();
@@ -1182,6 +1213,7 @@ int main(int argc, char** argv)
         FILE *fp2;
         string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
         fp2 = fopen(log_dir.c_str(),"w");
+        if (!fp2) { std::cerr << "Cannot write timing log" << std::endl; return 1; }
         fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
         for (int i = 0;i<time_log_counter; i++){
             fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
