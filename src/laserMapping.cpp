@@ -62,6 +62,8 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
+#include <perception_interfaces/msg/processing_fps.hpp>
+#include <perception_interfaces/fps_window.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -815,6 +817,9 @@ class LaserMappingNode : public rclcpp::Node
 public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
+        const double fps_report_period = this->declare_parameter<double>("fps_report_period", 1.0);  // FPS 窗口 [s]，须有限且 >0；增大更平滑但刷新更慢，减小则相反
+        if (!std::isfinite(fps_report_period) || fps_report_period <= 0.0)
+            throw std::invalid_argument("fps_report_period must be finite and greater than zero");
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -957,6 +962,7 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        fps_publisher_ = this->create_publisher<perception_interfaces::msg::ProcessingFps>("/fastlio/processing_fps", 1);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
@@ -967,6 +973,8 @@ public:
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        fps_timer_ = this->create_wall_timer(std::chrono::duration<double>(fps_report_period),
+            std::bind(&LaserMappingNode::report_fps, this));
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -999,6 +1007,8 @@ private:
             solve_const_H_time = 0;
             svd_time   = 0;
             t0 = omp_get_wtime();
+
+            const double algorithm_start = perception_interfaces::steady_seconds();
 
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
@@ -1054,9 +1064,11 @@ private:
             feats_down_world->resize(feats_down_size);
 
             V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
+            const double debug_start = perception_interfaces::steady_seconds();
             if (runtime_pos_log && time_log_counter < MAXN && fout_pre) fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
             <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
 
+            const double debug_seconds = perception_interfaces::steady_seconds() - debug_start;
             if(0) // If you need to see map point, change to "if(1)"
             {
                 PointVector ().swap(ikdtree.PCL_Storage);
@@ -1087,11 +1099,15 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
+            const double estimation_seconds = perception_interfaces::steady_seconds() - algorithm_start - debug_seconds;
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
+            const double map_start = perception_interfaces::steady_seconds();
             map_incremental();
+            const double map_seconds = perception_interfaces::steady_seconds() - map_start;
+            fps_window_.record(std::max(0.0, estimation_seconds + map_seconds));
             t5 = omp_get_wtime();
             
             if (map_pub_en || pcd_save_en) append_recent_map();
@@ -1134,6 +1150,16 @@ private:
         }
     }
 
+    void report_fps()
+    {
+        const auto fps = fps_window_.snapshot();
+        perception_interfaces::msg::ProcessingFps message;
+        message.stamp = this->get_clock()->now();
+        message.algorithm_fps = fps.algorithm_fps;
+        message.throughput_fps = fps.throughput_fps;
+        fps_publisher_->publish(message);
+    }
+
     void map_publish_callback()
     {
         if (map_pub_en) publish_map(pubLaserCloudMap_);
@@ -1165,6 +1191,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<perception_interfaces::msg::ProcessingFps>::SharedPtr fps_publisher_;
+    perception_interfaces::FpsWindow fps_window_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
@@ -1172,6 +1200,7 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
+    rclcpp::TimerBase::SharedPtr fps_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;
