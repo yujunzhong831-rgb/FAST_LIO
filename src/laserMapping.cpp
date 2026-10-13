@@ -651,7 +651,12 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
-    // 协方差必须随本次状态一起发布；twist 仍未实现，不能用于速度控制。
+    const V3D velocity_body =
+        state_point.rot.conjugate() * state_point.vel;
+    odomAftMapped.twist.twist.linear.x = velocity_body.x();
+    odomAftMapped.twist.twist.linear.y = velocity_body.y();
+    odomAftMapped.twist.twist.linear.z = velocity_body.z();
+    // 当前位姿协方差与 body 系线速度一起发布；角速度和 twist 协方差未填写。
     pubOdomAftMapped->publish(odomAftMapped);
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
